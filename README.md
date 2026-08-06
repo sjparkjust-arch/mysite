@@ -1,4 +1,4 @@
-# Django File Board
+# Django File Board!!
 
 Django 기반의 파일 자료실 게시판 실습 프로젝트입니다.
 
