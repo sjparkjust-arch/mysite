@@ -1,0 +1,31 @@
+{% extends "board/base.html" %}
+
+{% block title %}자료 삭제{% endblock %}
+
+{% block content %}
+<section class="delete-card">
+    <div class="delete-icon">!</div>
+
+    <h1>자료를 삭제하시겠습니까?</h1>
+
+    <p>
+        <strong>{{ post.title }}</strong>과 첨부파일이 함께 삭제됩니다.
+        삭제 후에는 복구할 수 없습니다.
+    </p>
+
+    <form method="post" class="form-actions center">
+        {% csrf_token %}
+
+        <a
+            href="{% url 'board:post_detail' post.id %}"
+            class="button button-light"
+        >
+            취소
+        </a>
+
+        <button type="submit" class="button button-danger">
+            삭제하기
+        </button>
+    </form>
+</section>
+{% endblock %}

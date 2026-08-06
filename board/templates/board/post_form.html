@@ -1,0 +1,155 @@
+{% extends "board/base.html" %}
+
+{% block title %}
+    {% if mode == "add" %}자료 등록{% else %}자료 수정{% endif %}
+{% endblock %}
+
+{% block content %}
+<section class="form-card">
+    <header class="form-header">
+        <span class="eyebrow">FILE BOARD</span>
+
+        <h1>
+            {% if mode == "add" %}
+                새로운 자료 등록
+            {% else %}
+                자료 수정
+            {% endif %}
+        </h1>
+
+        <p>
+            자료 설명과 첨부파일을 등록하세요.
+        </p>
+    </header>
+
+    <form method="post" enctype="multipart/form-data" id="post-form">
+        {% csrf_token %}
+
+        <div class="form-group">
+            <label for="title">
+                제목 <span class="required">*</span>
+            </label>
+
+            <input
+                type="text"
+                id="title"
+                name="title"
+                maxlength="100"
+                value="{{ title }}"
+                placeholder="자료 제목을 입력하세요"
+                required
+            >
+
+            <div class="field-help">
+                <span>{{ errors.title }}</span>
+                <span id="title-count">0 / 100</span>
+            </div>
+        </div>
+
+        <div class="form-group">
+            <label for="writer">작성자</label>
+
+            <input
+                type="text"
+                id="writer"
+                value="{{ request.user.username }}"
+                readonly
+            >
+        </div>
+
+        <div class="form-group">
+            <label for="content">
+                내용 <span class="required">*</span>
+            </label>
+
+            <textarea
+                id="content"
+                name="content"
+                rows="12"
+                placeholder="자료에 대한 설명을 입력하세요"
+                required
+            >{{ content }}</textarea>
+
+            <p class="field-error">{{ errors.content }}</p>
+        </div>
+
+        {% if mode == "update" %}
+            <div class="form-group">
+                <label>기존 첨부파일</label>
+
+                <div class="existing-file-list">
+                    {% for attachment in post.attachments.all %}
+                        <label class="existing-file-item">
+                            <span>📄 {{ attachment.original_name }}</span>
+
+                            <span>
+                                <input
+                                    type="checkbox"
+                                    name="delete_attachments"
+                                    value="{{ attachment.id }}"
+                                >
+                                삭제
+                            </span>
+                        </label>
+                    {% empty %}
+                        <p class="empty-text">기존 첨부파일이 없습니다.</p>
+                    {% endfor %}
+                </div>
+            </div>
+        {% endif %}
+
+        <div class="form-group">
+            <label for="files">첨부파일</label>
+
+            <div class="file-drop-zone" id="file-drop-zone">
+                <input
+                    type="file"
+                    id="files"
+                    name="files"
+                    multiple
+                    hidden
+                >
+
+                <div class="drop-icon">☁</div>
+
+                <strong>파일을 끌어다 놓으세요.</strong>
+
+                <p>또는 아래 버튼을 눌러 파일을 선택하세요.</p>
+
+                <button
+                    type="button"
+                    class="button button-outline"
+                    id="file-select-button"
+                >
+                    파일 선택
+                </button>
+            </div>
+
+            <div id="selected-file-list" class="selected-file-list"></div>
+
+            <p class="field-error">{{ errors.files }}</p>
+        </div>
+
+        <div class="form-actions">
+            <a
+                href="{% url 'board:post_list' %}"
+                class="button button-light"
+            >
+                취소
+            </a>
+
+            <button type="submit" class="button button-primary">
+                {% if mode == "add" %}등록하기{% else %}수정하기{% endif %}
+            </button>
+        </div>
+    </form>
+</section>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+    window.addEventListener("DOMContentLoaded", () => {
+        initializePostForm();
+    });
+</script>
+{% endblock %}

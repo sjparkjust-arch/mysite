@@ -1,0 +1,100 @@
+{% extends "board/base.html" %}
+
+{% block title %}회원가입 | Django 자료실{% endblock %}
+
+{% block content %}
+<section class="auth-layout">
+    <div class="auth-intro">
+        <span class="eyebrow">CREATE ACCOUNT</span>
+        <h1>자료 공유에 참여하세요.</h1>
+
+        <p>
+            계정을 만들면 자료 등록과 인증 파일 다운로드 기능을
+            사용할 수 있습니다.
+        </p>
+    </div>
+
+    <div class="auth-card">
+        <h2>회원가입</h2>
+
+        <form method="post">
+            {% csrf_token %}
+
+            <div class="form-group">
+                <label for="username">아이디</label>
+
+                <input
+                    type="text"
+                    id="username"
+                    name="username"
+                    value="{{ username }}"
+                    autocomplete="username"
+                    required
+                >
+
+                <p class="field-error">{{ errors.username }}</p>
+            </div>
+
+            <div class="form-group">
+                <label for="password1">비밀번호</label>
+
+                <div class="password-wrap">
+                    <input
+                        type="password"
+                        id="password1"
+                        name="password1"
+                        autocomplete="new-password"
+                        required
+                    >
+
+                    <button
+                        type="button"
+                        class="password-toggle"
+                        data-target="password1"
+                    >
+                        보기
+                    </button>
+                </div>
+
+                <p class="field-error">{{ errors.password1 }}</p>
+            </div>
+
+            <div class="form-group">
+                <label for="password2">비밀번호 확인</label>
+
+                <div class="password-wrap">
+                    <input
+                        type="password"
+                        id="password2"
+                        name="password2"
+                        autocomplete="new-password"
+                        required
+                    >
+
+                    <button
+                        type="button"
+                        class="password-toggle"
+                        data-target="password2"
+                    >
+                        보기
+                    </button>
+                </div>
+
+                <p class="field-error">{{ errors.password2 }}</p>
+            </div>
+
+            <button
+                type="submit"
+                class="button button-primary button-full"
+            >
+                계정 만들기
+            </button>
+        </form>
+
+        <p class="auth-link">
+            이미 계정이 있나요?
+            <a href="{% url 'board:signin' %}">로그인</a>
+        </p>
+    </div>
+</section>
+{% endblock %}

@@ -1,0 +1,86 @@
+{% extends "board/base.html" %}
+
+{% block title %}로그인 | Django 자료실{% endblock %}
+
+{% block content %}
+<section class="auth-layout">
+    <div class="auth-intro">
+        <span class="eyebrow">MEMBER ACCESS</span>
+        <h1>자료실에 로그인하세요.</h1>
+
+        <p>
+            회원은 게시글 상세 조회, 파일 다운로드 및 자료 등록 기능을
+            사용할 수 있습니다.
+        </p>
+
+        <ul>
+            <li>자료 등록 및 관리</li>
+            <li>인증된 첨부파일 다운로드</li>
+            <li>본인이 등록한 게시글 수정·삭제</li>
+        </ul>
+    </div>
+
+    <div class="auth-card">
+        <h2>로그인</h2>
+
+        <form method="post">
+            {% csrf_token %}
+
+            <input
+                type="hidden"
+                name="next"
+                value="{{ next }}"
+            >
+
+            <div class="form-group">
+                <label for="username">아이디</label>
+
+                <input
+                    type="text"
+                    id="username"
+                    name="username"
+                    value="{{ username }}"
+                    autocomplete="username"
+                    required
+                >
+            </div>
+
+            <div class="form-group">
+                <label for="password">비밀번호</label>
+
+                <div class="password-wrap">
+                    <input
+                        type="password"
+                        id="password"
+                        name="password"
+                        autocomplete="current-password"
+                        required
+                    >
+
+                    <button
+                        type="button"
+                        class="password-toggle"
+                        data-target="password"
+                    >
+                        보기
+                    </button>
+                </div>
+            </div>
+
+            <p class="field-error">{{ errors.login }}</p>
+
+            <button
+                type="submit"
+                class="button button-primary button-full"
+            >
+                로그인
+            </button>
+        </form>
+
+        <p class="auth-link">
+            아직 계정이 없나요?
+            <a href="{% url 'board:signup' %}">회원가입</a>
+        </p>
+    </div>
+</section>
+{% endblock %}

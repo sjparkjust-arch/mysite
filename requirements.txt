@@ -1,0 +1,8 @@
+asgiref==3.11.1
+Django==6.0.6
+gunicorn==26.0.0
+mysqlclient==2.2.8
+packaging==26.2
+pip==25.1.1
+python-dotenv==1.2.2
+sqlparse==0.5.5

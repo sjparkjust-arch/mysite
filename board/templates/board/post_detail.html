@@ -1,0 +1,84 @@
+{% extends "board/base.html" %}
+
+{% block title %}{{ post.title }} | Django 자료실{% endblock %}
+
+{% block content %}
+<section class="detail-card">
+    <header class="detail-header">
+        <div>
+            <span class="eyebrow">DOCUMENT DETAIL</span>
+            <h1>{{ post.title }}</h1>
+        </div>
+
+        <div class="detail-meta">
+            <span>작성자 {{ post.author.username }}</span>
+            <span>{{ post.created_at|date:"Y-m-d H:i" }}</span>
+            <span>조회 {{ post.view_count }}</span>
+        </div>
+    </header>
+
+    <article class="post-content">
+        {{ post.content|linebreaksbr }}
+    </article>
+
+    <section class="attachment-section">
+        <div class="section-title-row">
+            <h2>첨부파일</h2>
+            <span>{{ post.attachments.count }}개</span>
+        </div>
+
+        <div class="attachment-list">
+            {% for attachment in post.attachments.all %}
+                <div class="attachment-item">
+                    <div class="attachment-icon">📄</div>
+
+                    <div class="attachment-info">
+                        <strong>{{ attachment.original_name }}</strong>
+                        <span>
+                            {{ attachment.uploaded_at|date:"Y-m-d H:i" }}
+                        </span>
+                    </div>
+
+                    <a
+                        href="{% url 'board:attachment_download' attachment.id %}"
+                        class="button button-outline"
+                    >
+                        다운로드
+                    </a>
+                </div>
+            {% empty %}
+                <p class="empty-text">
+                    첨부된 파일이 없습니다.
+                </p>
+            {% endfor %}
+        </div>
+    </section>
+
+    <footer class="detail-actions">
+        <a
+            href="{% url 'board:post_list' %}"
+            class="button button-light"
+        >
+            목록
+        </a>
+
+        {% if post.author == request.user %}
+            <div>
+                <a
+                    href="{% url 'board:post_update' post.id %}"
+                    class="button button-dark"
+                >
+                    수정
+                </a>
+
+                <a
+                    href="{% url 'board:post_delete' post.id %}"
+                    class="button button-danger"
+                >
+                    삭제
+                </a>
+            </div>
+        {% endif %}
+    </footer>
+</section>
+{% endblock %}
