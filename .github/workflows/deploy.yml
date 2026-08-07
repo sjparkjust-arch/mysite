@@ -1,0 +1,802 @@
+name: Test and Deploy Django
+
+on:
+  push:
+    branches:
+      - main
+
+  # GitHub Actions 화면에서 수동 실행
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# 동일 프로젝트의 배포가 동시에 실행되지 않도록 제한
+concurrency:
+  group: mysite-production-deploy
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-northeast-2
+
+  # 배포 대상 EC2 태그
+  PROJECT_TAG: mysite
+  ENVIRONMENT_TAG: production
+
+  # 배포 대상 GitHub 저장소
+  GIT_REPOSITORY: https://github.com/sjparkjust-arch/mysite.git
+
+  # EC2 내부 경로
+  PROJECT_DIR: /home/ubuntu/djangowork/mysite
+  VENV_DIR: /home/ubuntu/djangowork/workenv
+
+  # systemd 서비스 이름
+  GUNICORN_SERVICE: gunicorn
+
+  # Django collectstatic 결과 업로드 위치
+  S3_STATIC_URI: s3://mysiter-cdn-bucket-661550216216-ap-northeast-2-an/static
+
+jobs:
+  # ============================================================
+  # 1. Django 테스트
+  # ============================================================
+  test:
+    name: Run Django Tests
+    runs-on: ubuntu-latest
+
+    services:
+      mariadb:
+        image: mariadb:11
+
+        env:
+          MARIADB_DATABASE: testdb
+          MARIADB_USER: tester
+          MARIADB_PASSWORD: test-password
+          MARIADB_ROOT_PASSWORD: root-test-password
+
+        ports:
+          - 3306:3306
+
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install MariaDB build packages
+        run: |
+          set -Eeuo pipefail
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            default-libmysqlclient-dev
+
+      - name: Install Python dependencies
+        run: |
+          set -Eeuo pipefail
+
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # settings.py에서 BASE_DIR/.env를 읽으므로
+      # 테스트 실행용 임시 .env를 생성
+      - name: Create test environment file
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          cat > .env <<'EOF_ENV'
+          DJANGO_SECRET_KEY="github-actions-test-secret-key"
+          DJANGO_DEBUG="False"
+          DJANGO_ALLOWED_HOSTS="localhost,127.0.0.1,testserver"
+
+          DB_ENGINE="django.db.backends.mysql"
+          DB_NAME="testdb"
+          DB_USER="tester"
+          DB_PASSWORD="test-password"
+          DB_HOST="127.0.0.1"
+          DB_PORT="3306"
+
+          STATIC_URL="/static/"
+          STATIC_ROOT="staticfiles"
+          MEDIA_ROOT="/tmp/mysite/media/"
+          EOF_ENV
+
+          mkdir -p /tmp/mysite/media
+          chmod 600 .env
+
+      - name: Check Django configuration
+        run: |
+          set -Eeuo pipefail
+          python manage.py check
+
+      - name: Check missing migrations
+        run: |
+          set -Eeuo pipefail
+          python manage.py makemigrations --check --dry-run
+
+      - name: Run Django tests
+        run: |
+          set -Eeuo pipefail
+          python manage.py test board --verbosity 2
+
+  # ============================================================
+  # 2. AWS 배포
+  # 테스트에 성공한 경우에만 실행
+  # ============================================================
+  deploy:
+    name: Deploy to Private EC2
+    runs-on: ubuntu-latest
+    needs: test
+
+    environment: production
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v5
+
+      # OIDC를 사용하지 않고 IAM 사용자 Access Key 사용
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS identity
+        run: |
+          set -Eeuo pipefail
+          aws sts get-caller-identity
+
+      # ----------------------------------------------------------
+      # 태그가 일치하는 실행 중 Django EC2 전체 조회
+      # 태그:
+      # Project=mysite
+      # Environment=production
+      # ----------------------------------------------------------
+      - name: Find Django EC2 instances
+        id: django_instances
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          INSTANCE_IDS=$(aws ec2 describe-instances \
+            --region "$AWS_REGION" \
+            --filters \
+              "Name=tag:Project,Values=$PROJECT_TAG" \
+              "Name=tag:Environment,Values=$ENVIRONMENT_TAG" \
+              "Name=instance-state-name,Values=running" \
+            --query "Reservations[].Instances[].InstanceId" \
+            --output text)
+
+          if [ -z "$INSTANCE_IDS" ]; then
+            echo "배포 대상 Django EC2를 찾지 못했습니다."
+            exit 1
+          fi
+
+          INSTANCE_COUNT=$(wc -w <<< "$INSTANCE_IDS")
+
+          echo "배포 대상 EC2: $INSTANCE_IDS"
+          echo "검색된 서버 수: $INSTANCE_COUNT"
+
+          echo "instance_ids=$INSTANCE_IDS" >> "$GITHUB_OUTPUT"
+          echo "instance_count=$INSTANCE_COUNT" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------
+      # migrate, collectstatic, S3 sync 담당 대표 서버 조회
+      # 추가 태그:
+      # StaticPublisher=true
+      # ----------------------------------------------------------
+      - name: Find primary EC2 instance
+        id: primary_instance
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          PRIMARY_INSTANCE_ID=$(aws ec2 describe-instances \
+            --region "$AWS_REGION" \
+            --filters \
+              "Name=tag:Project,Values=$PROJECT_TAG" \
+              "Name=tag:Environment,Values=$ENVIRONMENT_TAG" \
+              "Name=tag:StaticPublisher,Values=true" \
+              "Name=instance-state-name,Values=running" \
+            --query "Reservations[].Instances[].InstanceId" \
+            --output text)
+
+          PRIMARY_COUNT=$(wc -w <<< "$PRIMARY_INSTANCE_ID")
+
+          if [ "$PRIMARY_COUNT" -ne 1 ]; then
+            echo "StaticPublisher=true인 EC2가 정확히 한 대여야 합니다."
+            echo "검색 결과: $PRIMARY_INSTANCE_ID"
+            exit 1
+          fi
+
+          echo "대표 EC2: $PRIMARY_INSTANCE_ID"
+          echo "instance_id=$PRIMARY_INSTANCE_ID" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------
+      # 개별 GitHub Secrets로 운영용 .env 내용 구성
+      # ----------------------------------------------------------
+      - name: Build production environment file
+        id: production_env
+        shell: bash
+        env:
+          DJANGO_SECRET_KEY: ${{ secrets.DJANGO_SECRET_KEY }}
+          DJANGO_DEBUG: ${{ secrets.DJANGO_DEBUG }}
+          DJANGO_ALLOWED_HOSTS: ${{ secrets.DJANGO_ALLOWED_HOSTS }}
+
+          DB_ENGINE: ${{ secrets.DB_ENGINE }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_PORT: ${{ secrets.DB_PORT }}
+
+          STATIC_URL: ${{ secrets.STATIC_URL }}
+          STATIC_ROOT: ${{ secrets.STATIC_ROOT }}
+          MEDIA_ROOT: ${{ secrets.MEDIA_ROOT }}
+        run: |
+          set -Eeuo pipefail
+
+          REQUIRED_SECRETS=(
+            DJANGO_SECRET_KEY
+            DJANGO_DEBUG
+            DJANGO_ALLOWED_HOSTS
+            DB_ENGINE
+            DB_NAME
+            DB_USER
+            DB_PASSWORD
+            DB_HOST
+            DB_PORT
+            STATIC_URL
+            STATIC_ROOT
+            MEDIA_ROOT
+          )
+
+          for SECRET_NAME in "${REQUIRED_SECRETS[@]}"; do
+            if [ -z "${!SECRET_NAME:-}" ]; then
+              echo "필수 GitHub Secret이 비어 있습니다: $SECRET_NAME"
+              exit 1
+            fi
+          done
+
+          python <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          groups = [
+              (
+                  "# Django",
+                  [
+                      "DJANGO_SECRET_KEY",
+                      "DJANGO_DEBUG",
+                      "DJANGO_ALLOWED_HOSTS",
+                  ],
+              ),
+              (
+                  "# MariaDB",
+                  [
+                      "DB_ENGINE",
+                      "DB_NAME",
+                      "DB_USER",
+                      "DB_PASSWORD",
+                      "DB_HOST",
+                      "DB_PORT",
+                  ],
+              ),
+              (
+                  "# 정적 파일 및 미디어",
+                  [
+                      "STATIC_URL",
+                      "STATIC_ROOT",
+                      "MEDIA_ROOT",
+                  ],
+              ),
+          ]
+
+          lines = []
+
+          for title, group_keys in groups:
+              lines.append(title)
+
+              for key in group_keys:
+                  lines.append(f"{key}={json.dumps(os.environ[key])}")
+
+              lines.append("")
+
+          Path("/tmp/production.env").write_text(
+              "\n".join(lines),
+              encoding="utf-8",
+          )
+          PY
+
+          ENV_BASE64=$(base64 -w 0 /tmp/production.env)
+
+          echo "::add-mask::$ENV_BASE64"
+          echo "base64=$ENV_BASE64" >> "$GITHUB_OUTPUT"
+
+          rm -f /tmp/production.env
+
+      # ----------------------------------------------------------
+      # 태그가 일치하는 모든 Django EC2에서 코드 및 환경파일 적용
+      # ----------------------------------------------------------
+      - name: Update application on tagged EC2 instances
+        id: update_application
+        shell: bash
+        env:
+          INSTANCE_IDS: ${{ steps.django_instances.outputs.instance_ids }}
+          PRODUCTION_ENV_BASE64: ${{ steps.production_env.outputs.base64 }}
+        run: |
+          set -Eeuo pipefail
+
+          read -r -d '' REMOTE_SCRIPT <<SCRIPT || true
+          set -Eeuo pipefail
+
+          PROJECT_DIR="$PROJECT_DIR"
+          VENV_DIR="$VENV_DIR"
+          GIT_REPOSITORY="$GIT_REPOSITORY"
+          ENV_FILE="\$PROJECT_DIR/.env"
+
+          echo "========================================"
+          echo "서버: \$(hostname)"
+          echo "Django 애플리케이션 배포 준비"
+          echo "========================================"
+
+          if [ ! -d "\$PROJECT_DIR/.git" ]; then
+            echo "Git 프로젝트를 찾을 수 없습니다: \$PROJECT_DIR"
+            exit 1
+          fi
+
+          if [ ! -x "\$VENV_DIR/bin/python" ]; then
+            echo "Python 가상환경을 찾을 수 없습니다: \$VENV_DIR"
+            exit 1
+          fi
+
+          echo "[1/8] GitHub 원격 저장소 확인 및 설정"
+
+          sudo -u ubuntu -H \
+            git -C "\$PROJECT_DIR" remote set-url origin "\$GIT_REPOSITORY"
+
+          CURRENT_REMOTE=\$(sudo -u ubuntu -H \
+            git -C "\$PROJECT_DIR" remote get-url origin)
+
+          echo "현재 origin: \$CURRENT_REMOTE"
+
+          if [ "\$CURRENT_REMOTE" != "\$GIT_REPOSITORY" ]; then
+            echo "원격 저장소 설정이 올바르지 않습니다."
+            exit 1
+          fi
+
+          echo "[2/8] GitHub 최신 정보 조회"
+
+          sudo -u ubuntu -H \
+            git -C "\$PROJECT_DIR" fetch --prune origin
+
+          echo "[3/8] main 브랜치 전환"
+
+          sudo -u ubuntu -H \
+            git -C "\$PROJECT_DIR" checkout main
+
+          echo "[4/8] origin/main 코드 적용"
+
+          sudo -u ubuntu -H \
+            git -C "\$PROJECT_DIR" reset --hard origin/main
+
+          echo "[5/8] 운영 .env 파일 생성"
+
+          printf '%s' "$PRODUCTION_ENV_BASE64" \
+            | base64 --decode \
+            > "\$ENV_FILE"
+
+          chown ubuntu:ubuntu "\$ENV_FILE"
+          chmod 600 "\$ENV_FILE"
+
+          if [ ! -s "\$ENV_FILE" ]; then
+            echo ".env 파일 생성에 실패했습니다."
+            exit 1
+          fi
+
+          echo "[6/8] pip 업그레이드"
+
+          sudo -u ubuntu -H \
+            "\$VENV_DIR/bin/python" \
+            -m pip install --upgrade pip
+
+          echo "[7/8] requirements.txt 설치"
+
+          sudo -u ubuntu -H \
+            "\$VENV_DIR/bin/pip" \
+            install -r "\$PROJECT_DIR/requirements.txt"
+
+          echo "[8/8] Django 설정 검사 및 적용값 확인"
+
+          cd "\$PROJECT_DIR"
+
+          sudo -u ubuntu -H \
+            "\$VENV_DIR/bin/python" \
+            manage.py check --deploy
+
+          sudo -u ubuntu -H \
+            "\$VENV_DIR/bin/python" \
+            manage.py shell -c \
+            "from django.conf import settings; print('STATIC_URL=', settings.STATIC_URL); print('STATIC_ROOT=', settings.STATIC_ROOT); print('MEDIA_ROOT=', settings.MEDIA_ROOT)"
+
+          echo "적용된 Git Commit:"
+
+          sudo -u ubuntu -H \
+            git -C "\$PROJECT_DIR" rev-parse HEAD
+
+          echo "배포 준비 완료"
+          SCRIPT
+
+          PARAMETERS=$(jq -n \
+            --arg command "$REMOTE_SCRIPT" \
+            '{commands: [$command]}')
+
+          COMMAND_ID=$(aws ssm send-command \
+            --region "$AWS_REGION" \
+            --instance-ids $INSTANCE_IDS \
+            --document-name "AWS-RunShellScript" \
+            --comment "Update mysite and create production environment" \
+            --timeout-seconds 1200 \
+            --parameters "$PARAMETERS" \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "SSM Command ID: $COMMAND_ID"
+          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------
+      # 대상 EC2 전체의 코드 갱신 및 .env 생성 결과 확인
+      # ----------------------------------------------------------
+      - name: Verify application update
+        shell: bash
+        env:
+          INSTANCE_IDS: ${{ steps.django_instances.outputs.instance_ids }}
+          COMMAND_ID: ${{ steps.update_application.outputs.command_id }}
+        run: |
+          set -Eeuo pipefail
+
+          FAILED=0
+
+          for INSTANCE_ID in $INSTANCE_IDS; do
+            echo "========================================"
+            echo "$INSTANCE_ID 배포 준비 결과"
+            echo "========================================"
+
+            if ! aws ssm wait command-executed \
+              --region "$AWS_REGION" \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID"; then
+              FAILED=1
+            fi
+
+            STATUS=$(aws ssm get-command-invocation \
+              --region "$AWS_REGION" \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query "Status" \
+              --output text)
+
+            echo "실행 상태: $STATUS"
+            echo "----- 표준 출력 -----"
+
+            aws ssm get-command-invocation \
+              --region "$AWS_REGION" \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query "StandardOutputContent" \
+              --output text || true
+
+            if [ "$STATUS" != "Success" ]; then
+              FAILED=1
+              echo "----- 오류 출력 -----"
+
+              aws ssm get-command-invocation \
+                --region "$AWS_REGION" \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --query "StandardErrorContent" \
+                --output text || true
+            fi
+          done
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo "한 대 이상의 EC2에서 배포 준비가 실패했습니다."
+            exit 1
+          fi
+
+      # ----------------------------------------------------------
+      # 대표 EC2 한 대에서 migrate, collectstatic, S3 sync 수행
+      # ----------------------------------------------------------
+      - name: Migrate database and publish static files
+        id: publish_static
+        shell: bash
+        env:
+          PRIMARY_INSTANCE_ID: ${{ steps.primary_instance.outputs.instance_id }}
+        run: |
+          set -Eeuo pipefail
+
+          read -r -d '' REMOTE_SCRIPT <<SCRIPT || true
+          set -Eeuo pipefail
+
+          PROJECT_DIR="$PROJECT_DIR"
+          VENV_DIR="$VENV_DIR"
+          S3_STATIC_URI="$S3_STATIC_URI"
+
+          cd "\$PROJECT_DIR"
+
+          if [ ! -f "\$PROJECT_DIR/.env" ]; then
+            echo ".env 파일을 찾을 수 없습니다."
+            exit 1
+          fi
+
+          echo "[1/5] Django 정적 파일 설정 확인"
+
+          sudo -u ubuntu -H \
+            "\$VENV_DIR/bin/python" \
+            manage.py shell -c \
+            "from django.conf import settings; print('STATIC_URL=', settings.STATIC_URL); print('STATIC_ROOT=', settings.STATIC_ROOT)"
+
+          echo "[2/5] 데이터베이스 마이그레이션"
+
+          sudo -u ubuntu -H \
+            "\$VENV_DIR/bin/python" \
+            manage.py migrate --noinput
+
+          echo "[3/5] Django 정적 파일 수집"
+
+          sudo -u ubuntu -H \
+            "\$VENV_DIR/bin/python" \
+            manage.py collectstatic --noinput --clear
+
+          STATIC_DIR=\$(sudo -u ubuntu -H \
+            "\$VENV_DIR/bin/python" \
+            manage.py shell -c \
+            "from django.conf import settings; print(settings.STATIC_ROOT)" \
+            | tail -n 1 \
+            | tr -d '\r')
+
+          echo "실제 STATIC_ROOT: \$STATIC_DIR"
+
+          if [ ! -d "\$STATIC_DIR" ]; then
+            echo "정적 파일 디렉터리가 없습니다: \$STATIC_DIR"
+            exit 1
+          fi
+
+          echo "수집된 정적 파일 개수:"
+          find "\$STATIC_DIR" -type f | wc -l
+
+          echo "[4/5] S3 변경 예정 작업 확인"
+
+          aws s3 sync \
+            "\$STATIC_DIR/" \
+            "\$S3_STATIC_URI/" \
+            --delete \
+            --dryrun
+
+          echo "[5/5] S3 정적 파일 동기화"
+
+          aws s3 sync \
+            "\$STATIC_DIR/" \
+            "\$S3_STATIC_URI/" \
+            --delete
+
+          aws s3 ls \
+            "\$S3_STATIC_URI/" \
+            --recursive \
+            --summarize
+
+          echo "DB 마이그레이션 및 정적 파일 배포 완료"
+          SCRIPT
+
+          PARAMETERS=$(jq -n \
+            --arg command "$REMOTE_SCRIPT" \
+            '{commands: [$command]}')
+
+          COMMAND_ID=$(aws ssm send-command \
+            --region "$AWS_REGION" \
+            --instance-ids "$PRIMARY_INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Migrate database and publish static files" \
+            --timeout-seconds 1200 \
+            --parameters "$PARAMETERS" \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "SSM Command ID: $COMMAND_ID"
+          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------
+      # migrate, collectstatic, S3 sync 결과 확인
+      # ----------------------------------------------------------
+      - name: Verify migration and static deployment
+        shell: bash
+        env:
+          PRIMARY_INSTANCE_ID: ${{ steps.primary_instance.outputs.instance_id }}
+          COMMAND_ID: ${{ steps.publish_static.outputs.command_id }}
+        run: |
+          set -Eeuo pipefail
+
+          WAIT_FAILED=0
+
+          if ! aws ssm wait command-executed \
+            --region "$AWS_REGION" \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$PRIMARY_INSTANCE_ID"; then
+            WAIT_FAILED=1
+          fi
+
+          STATUS=$(aws ssm get-command-invocation \
+            --region "$AWS_REGION" \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$PRIMARY_INSTANCE_ID" \
+            --query "Status" \
+            --output text)
+
+          echo "실행 상태: $STATUS"
+          echo "----- 표준 출력 -----"
+
+          aws ssm get-command-invocation \
+            --region "$AWS_REGION" \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$PRIMARY_INSTANCE_ID" \
+            --query "StandardOutputContent" \
+            --output text || true
+
+          if [ "$WAIT_FAILED" -ne 0 ] || [ "$STATUS" != "Success" ]; then
+            echo "----- 오류 출력 -----"
+
+            aws ssm get-command-invocation \
+              --region "$AWS_REGION" \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$PRIMARY_INSTANCE_ID" \
+              --query "StandardErrorContent" \
+              --output text || true
+
+            exit 1
+          fi
+
+      # ----------------------------------------------------------
+      # 태그가 일치하는 모든 Django EC2의 Gunicorn 재시작
+      # ----------------------------------------------------------
+      - name: Restart Gunicorn on tagged EC2 instances
+        id: restart_gunicorn
+        shell: bash
+        env:
+          INSTANCE_IDS: ${{ steps.django_instances.outputs.instance_ids }}
+        run: |
+          set -Eeuo pipefail
+
+          read -r -d '' REMOTE_SCRIPT <<SCRIPT || true
+          set -Eeuo pipefail
+
+          SERVICE_NAME="$GUNICORN_SERVICE"
+
+          echo "Gunicorn 재시작"
+          systemctl restart "\$SERVICE_NAME"
+
+          sleep 3
+
+          echo "Gunicorn 활성 상태 확인"
+          systemctl is-active --quiet "\$SERVICE_NAME"
+
+          echo "Gunicorn 서비스 상태"
+          systemctl status "\$SERVICE_NAME" --no-pager
+
+          echo "Gunicorn 재시작 완료"
+          SCRIPT
+
+          PARAMETERS=$(jq -n \
+            --arg command "$REMOTE_SCRIPT" \
+            '{commands: [$command]}')
+
+          COMMAND_ID=$(aws ssm send-command \
+            --region "$AWS_REGION" \
+            --instance-ids $INSTANCE_IDS \
+            --document-name "AWS-RunShellScript" \
+            --comment "Restart mysite Gunicorn" \
+            --timeout-seconds 300 \
+            --parameters "$PARAMETERS" \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "SSM Command ID: $COMMAND_ID"
+          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------
+      # 대상 EC2 전체의 Gunicorn 상태 확인
+      # ----------------------------------------------------------
+      - name: Verify Gunicorn
+        shell: bash
+        env:
+          INSTANCE_IDS: ${{ steps.django_instances.outputs.instance_ids }}
+          COMMAND_ID: ${{ steps.restart_gunicorn.outputs.command_id }}
+        run: |
+          set -Eeuo pipefail
+
+          FAILED=0
+
+          for INSTANCE_ID in $INSTANCE_IDS; do
+            echo "========================================"
+            echo "$INSTANCE_ID Gunicorn 실행 결과"
+            echo "========================================"
+
+            if ! aws ssm wait command-executed \
+              --region "$AWS_REGION" \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID"; then
+              FAILED=1
+            fi
+
+            STATUS=$(aws ssm get-command-invocation \
+              --region "$AWS_REGION" \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query "Status" \
+              --output text)
+
+            echo "실행 상태: $STATUS"
+            echo "----- 표준 출력 -----"
+
+            aws ssm get-command-invocation \
+              --region "$AWS_REGION" \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query "StandardOutputContent" \
+              --output text || true
+
+            if [ "$STATUS" != "Success" ]; then
+              FAILED=1
+              echo "----- 오류 출력 -----"
+
+              aws ssm get-command-invocation \
+                --region "$AWS_REGION" \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --query "StandardErrorContent" \
+                --output text || true
+            fi
+          done
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo "한 대 이상의 EC2에서 Gunicorn 재시작이 실패했습니다."
+            exit 1
+          fi
+
+      # ----------------------------------------------------------
+      # GitHub Actions 실행 결과 요약
+      # ----------------------------------------------------------
+      - name: Deployment summary
+        env: 
+            INSTANCE_COUNT: ${{ steps.django_instances.outputs.instance_count }}
+        run: |
+          {
+            echo "## Mysite 배포 완료"
+            echo
+            echo "- Django 테스트: 성공"
+            echo "- 배포 브랜치: \`${GITHUB_REF_NAME}\`"
+            echo "- 배포 Commit: \`${GITHUB_SHA}\`"
+            echo "- 배포 저장소: \`${GIT_REPOSITORY}\`"
+            echo "- Django EC2: ${INSTANCE_COUNT}대"
+            echo "- 운영 .env: GitHub Secrets로 생성"
+            echo "- STATIC_URL: GitHub Secret로 적용"
+            echo "- DB 마이그레이션: 완료"
+            echo "- collectstatic: 완료"
+            echo "- S3 정적 파일 동기화: 완료"
+            echo "- Gunicorn 재시작: 완료"
+          } >> "$GITHUB_STEP_SUMMARY"
