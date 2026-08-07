@@ -173,7 +173,11 @@ STATIC_ROOT = env_path("STATIC_ROOT", "staticfiles")
 #         COMMON_STATIC_DIR,
 #     ]
 
-MEDIA_URL = "/media/"
+#MEDIA_URL = "/media/"
+MEDIA_URL = os.getenv(
+    "MEDIA_URL",
+    "/media/",
+)
 MEDIA_ROOT = env_path("MEDIA_ROOT", "media")
 
 LOGIN_URL = "board:signin"
