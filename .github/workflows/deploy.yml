@@ -36,6 +36,13 @@ env:
   # Django collectstatic 결과 업로드 위치
   S3_STATIC_URI: s3://mysiter-cdn-bucket-661550216216-ap-northeast-2-an/static
 
+  # ============================================================
+  # ASG 롤링 업데이트용 설정
+  # TODO: 실제 값으로 바꿔주세요
+  # ============================================================
+  LAUNCH_TEMPLATE_NAME: mysite-django-lt
+  ASG_NAME: mysite-django-asg
+
 jobs:
   # ============================================================
   # 1. Django 테스트
@@ -134,7 +141,7 @@ jobs:
           python manage.py test board --verbosity 2
 
   # ============================================================
-  # 2. AWS 배포
+  # 2. AWS 배포 (현재 떠 있는 EC2에 코드 배포)
   # 테스트에 성공한 경우에만 실행
   # ============================================================
   deploy:
@@ -143,6 +150,9 @@ jobs:
     needs: test
 
     environment: production
+
+    outputs:
+      primary_instance_id: ${{ steps.primary_instance.outputs.instance_id }}
 
     steps:
       - name: Checkout source code
@@ -782,7 +792,7 @@ jobs:
       # GitHub Actions 실행 결과 요약
       # ----------------------------------------------------------
       - name: Deployment summary
-        env: 
+        env:
             INSTANCE_COUNT: ${{ steps.django_instances.outputs.instance_count }}
         run: |
           {
@@ -800,3 +810,232 @@ jobs:
             echo "- S3 정적 파일 동기화: 완료"
             echo "- Gunicorn 재시작: 완료"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # ============================================================
+  # 3. AMI 생성
+  # 배포가 끝난 대표(primary) 인스턴스를 기준으로 새 AMI 생성
+  # ============================================================
+  build_ami:
+    name: Build AMI from Primary Instance
+    runs-on: ubuntu-latest
+    needs: deploy
+
+    environment: production
+
+    outputs:
+      ami_id: ${{ steps.create_ami.outputs.ami_id }}
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ----------------------------------------------------------
+      # 대표 EC2 인스턴스로 새 AMI 생성
+      # ----------------------------------------------------------
+      - name: Create AMI
+        id: create_ami
+        shell: bash
+        env:
+          PRIMARY_INSTANCE_ID: ${{ needs.deploy.outputs.primary_instance_id }}
+        run: |
+          set -Eeuo pipefail
+
+          AMI_NAME="mysite-$(date -u +%Y%m%d-%H%M%S)"
+
+          echo "AMI 생성 시작: $AMI_NAME (기준 인스턴스: $PRIMARY_INSTANCE_ID)"
+
+          AMI_ID=$(aws ec2 create-image \
+            --region "$AWS_REGION" \
+            --instance-id "$PRIMARY_INSTANCE_ID" \
+            --name "$AMI_NAME" \
+            --description "mysite production image built from GitHub Actions run $GITHUB_RUN_ID" \
+            --tag-specifications "ResourceType=image,Tags=[{Key=Project,Value=$PROJECT_TAG},{Key=Environment,Value=$ENVIRONMENT_TAG},{Key=GitSha,Value=$GITHUB_SHA}]" \
+            --no-reboot \
+            --query "ImageId" \
+            --output text)
+
+          echo "생성된 AMI: $AMI_ID"
+          echo "ami_id=$AMI_ID" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------
+      # AMI가 available 상태가 될 때까지 대기
+      # ----------------------------------------------------------
+      - name: Wait for AMI to become available
+        shell: bash
+        env:
+          AMI_ID: ${{ steps.create_ami.outputs.ami_id }}
+        run: |
+          set -Eeuo pipefail
+
+          echo "AMI 생성 대기 중: $AMI_ID (최대 약 20분)"
+
+          aws ec2 wait image-available \
+            --region "$AWS_REGION" \
+            --image-ids "$AMI_ID"
+
+          STATE=$(aws ec2 describe-images \
+            --region "$AWS_REGION" \
+            --image-ids "$AMI_ID" \
+            --query "Images[0].State" \
+            --output text)
+
+          echo "AMI 상태: $STATE"
+
+          if [ "$STATE" != "available" ]; then
+            echo "AMI 생성에 실패했습니다."
+            exit 1
+          fi
+
+  # ============================================================
+  # 4. 시작 템플릿 갱신
+  # 새 AMI를 반영한 새 버전을 만들고 기본 버전으로 지정
+  # ============================================================
+  update_launch_template:
+    name: Update Launch Template
+    runs-on: ubuntu-latest
+    needs: build_ami
+
+    environment: production
+
+    outputs:
+      new_version: ${{ steps.new_version.outputs.new_version }}
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ----------------------------------------------------------
+      # 새 AMI를 반영한 시작 템플릿 새 버전 생성
+      # ----------------------------------------------------------
+      - name: Create new launch template version
+        id: new_version
+        shell: bash
+        env:
+          AMI_ID: ${{ needs.build_ami.outputs.ami_id }}
+        run: |
+          set -Eeuo pipefail
+
+          LAUNCH_TEMPLATE_DATA=$(jq -n --arg ami "$AMI_ID" '{ImageId: $ami}')
+
+          NEW_VERSION=$(aws ec2 create-launch-template-version \
+            --region "$AWS_REGION" \
+            --launch-template-name "$LAUNCH_TEMPLATE_NAME" \
+            --source-version '$Latest' \
+            --launch-template-data "$LAUNCH_TEMPLATE_DATA" \
+            --query "LaunchTemplateVersion.VersionNumber" \
+            --output text)
+
+          echo "새 시작 템플릿 버전: $NEW_VERSION (AMI: $AMI_ID)"
+          echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------
+      # 새 버전을 기본(Default) 버전으로 지정
+      # ----------------------------------------------------------
+      - name: Set default launch template version
+        shell: bash
+        env:
+          NEW_VERSION: ${{ steps.new_version.outputs.new_version }}
+        run: |
+          set -Eeuo pipefail
+
+          aws ec2 modify-launch-template \
+            --region "$AWS_REGION" \
+            --launch-template-name "$LAUNCH_TEMPLATE_NAME" \
+            --default-version "$NEW_VERSION"
+
+          echo "기본 버전을 $NEW_VERSION 으로 변경 완료"
+
+  # ============================================================
+  # 5. ASG 롤링 업데이트
+  # 인스턴스 리프레시로 새 시작 템플릿 버전을 순차 적용
+  # ============================================================
+  rolling_update:
+    name: Rolling Update via ASG Instance Refresh
+    runs-on: ubuntu-latest
+    needs: update_launch_template
+
+    environment: production
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ----------------------------------------------------------
+      # ASG 인스턴스 리프레시 시작
+      # ----------------------------------------------------------
+      - name: Start instance refresh
+        id: start_refresh
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          PREFERENCES=$(jq -n \
+            '{MinHealthyPercentage: 90, InstanceWarmup: 120}')
+
+          REFRESH_ID=$(aws autoscaling start-instance-refresh \
+            --region "$AWS_REGION" \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --preferences "$PREFERENCES" \
+            --query "InstanceRefreshId" \
+            --output text)
+
+          echo "인스턴스 리프레시 시작: $REFRESH_ID"
+          echo "refresh_id=$REFRESH_ID" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------
+      # 리프레시가 끝날 때까지 상태를 주기적으로 확인
+      # ----------------------------------------------------------
+      - name: Wait for instance refresh to complete
+        shell: bash
+        env:
+          REFRESH_ID: ${{ steps.start_refresh.outputs.refresh_id }}
+        run: |
+          set -Eeuo pipefail
+
+          echo "인스턴스 리프레시 진행 상황 확인 중 (최대 30분)"
+
+          for i in $(seq 1 60); do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --region "$AWS_REGION" \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --instance-refresh-ids "$REFRESH_ID" \
+              --query "InstanceRefreshes[0].Status" \
+              --output text)
+
+            PERCENT=$(aws autoscaling describe-instance-refreshes \
+              --region "$AWS_REGION" \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --instance-refresh-ids "$REFRESH_ID" \
+              --query "InstanceRefreshes[0].PercentageComplete" \
+              --output text)
+
+            echo "[$i] 상태: $STATUS, 진행률: ${PERCENT}%"
+
+            case "$STATUS" in
+              Successful)
+                echo "인스턴스 리프레시 완료"
+                exit 0
+                ;;
+              Failed|Cancelled|RollbackFailed|RollbackSuccessful)
+                echo "인스턴스 리프레시가 실패했거나 취소되었습니다: $STATUS"
+                exit 1
+                ;;
+            esac
+
+            sleep 30
+          done
+
+          echo "인스턴스 리프레시가 시간 내에 끝나지 않았습니다."
+          exit 1
